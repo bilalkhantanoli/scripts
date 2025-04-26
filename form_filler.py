@@ -34,6 +34,7 @@ class FormFillerApp:
         self.max_retries = tk.IntVar(value=3)
         self.file_type = tk.StringVar(value="csv")
         self.max_entries_to_process = tk.IntVar(value=0) # 0 means process all
+        self.web_password = tk.StringVar()
         
         self.automation_thread = None
         self.stop_event = Event()
@@ -59,6 +60,12 @@ class FormFillerApp:
         url_frame.pack(fill=tk.X, padx=5, pady=5)
         
         ttk.Entry(url_frame, textvariable=self.website_url, width=50).pack(side=tk.LEFT, padx=5)
+
+        # Password (if required)
+        password_frame = ttk.LabelFrame(main_frame, text="Password (if required)", padding="10")
+        password_frame.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Label(password_frame, text="Password:").pack(side=tk.LEFT, padx=5)
+        ttk.Entry(password_frame, textvariable=self.web_password, show="*", width=30).pack(side=tk.LEFT, padx=5)
         
         # Settings frame
         settings_frame = ttk.LabelFrame(main_frame, text="Settings", padding="10")
@@ -252,31 +259,115 @@ class FormFillerApp:
                     self.log_message(f"Navigating to {self.website_url.get()}")
                     page.goto(self.website_url.get(), wait_until='networkidle') # Wait for network idle on initial load
                     
-                    self.log_message("Waiting for manual login...")
-                    self.update_status("Waiting for manual login...")
-
-                    login_confirmed = Event()
-
-                    def show_login_prompt():
-                        messagebox.showinfo("Manual Login Required",
-                                            "Please log in to the website in the browser window. Click OK here when you are logged in and ready to proceed.")
-                        login_confirmed.set()
-
-                    self.root.after(0, show_login_prompt)
-
-                    login_confirmed.wait()
-
-                    self.log_message("User confirmed login. Adding a longer wait (5s) for page elements to load...")
-                    page.wait_for_timeout(5000)
-
-                    # Debug: Take screenshot and save HTML before searching for #element_0
-                    debug_dir = os.path.dirname(os.path.abspath(__file__))
-                    screenshot_path = os.path.join(debug_dir, f"debug_after_login.png")
-                    html_path = os.path.join(debug_dir, f"debug_after_login.html")
-                    page.screenshot(path=screenshot_path)
-                    with open(html_path, 'w', encoding='utf-8') as f:
-                        f.write(page.content())
-                    self.log_message(f"Saved screenshot to {screenshot_path} and HTML to {html_path} for debugging.")
+                    if self.web_password.get():
+                        try:
+                            self.log_message("Password provided, attempting automatic login...")
+                            
+                            # Wait for page to load completely
+                            page.wait_for_load_state('networkidle')
+                            
+                            # First attempt - look for password field directly in main document
+                            pw_field_exists = page.locator('input[type="password"]').count() > 0
+                            
+                            if pw_field_exists:
+                                # Password field found directly on page
+                                self.log_message("Found password field in main document")
+                                pw_input = page.locator('input[type="password"]').first
+                                pw_input.fill(self.web_password.get())
+                                
+                                # Find the nearest form or submit button
+                                submit_button = page.locator('button[type="submit"], input[type="submit"]').first
+                                if submit_button:
+                                    submit_button.click()
+                                    self.log_message("Submitted password form, waiting for login to complete...")
+                                else:
+                                    # Try to submit using Enter key if no submit button found
+                                    pw_input.press("Enter")
+                                    self.log_message("Submit button not found, pressed Enter key instead")
+                            else:
+                                # Check for iframes
+                                self.log_message("Password field not found in main document, checking iframes...")
+                                frames = page.frames
+                                self.log_message(f"Found {len(frames)} frames in the page")
+                                
+                                for frame in frames:
+                                    try:
+                                        # Check if this frame has a password field
+                                        if frame.locator('input[type="password"]').count() > 0:
+                                            self.log_message(f"Found password field in iframe")
+                                            frame.locator('input[type="password"]').first.fill(self.web_password.get())
+                                            
+                                            # Try to find a submit button
+                                            if frame.locator('button[type="submit"], input[type="submit"]').count() > 0:
+                                                frame.locator('button[type="submit"], input[type="submit"]').first.click()
+                                                self.log_message("Submitted password form in iframe, waiting for login to complete...")
+                                                break
+                                            else:
+                                                # Try to submit using Enter key if no submit button found
+                                                frame.locator('input[type="password"]').first.press("Enter")
+                                                self.log_message("Submit button not found in iframe, pressed Enter key instead")
+                                                break
+                                    except Exception as frame_err:
+                                        self.log_message(f"Error checking iframe: {frame_err}")
+                                        continue
+                            
+                            # Wait for login to complete - look for content that indicates success
+                            page.wait_for_load_state('networkidle')
+                            page.wait_for_timeout(5000)  # Give it 5 seconds to settle
+                            
+                            # Check for successful login by looking for the form iframe
+                            if page.locator('iframe[src*="emailmeform.com"]').count() > 0 or page.locator('#element_0').count() > 0:
+                                self.log_message("Login successful, proceeding to form filling.")
+                            else:
+                                # Take a screenshot for debugging
+                                screenshot_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "login_debug.png")
+                                page.screenshot(path=screenshot_path)
+                                self.log_message(f"Login may have failed. Saved screenshot to {screenshot_path}")
+                                
+                                # Ask user to confirm if login was successful
+                                login_confirmed = Event()
+                                def ask_login_confirmation():
+                                    result = messagebox.askyesno("Login Check", 
+                                                                "Was the login successful? Click Yes to continue, No to abort.")
+                                    if result:
+                                        login_confirmed.set()
+                                    else:
+                                        self.stop_event.set()
+                                self.root.after(0, ask_login_confirmation)
+                                login_confirmed.wait()
+                                
+                                if self.stop_event.is_set():
+                                    self.log_message("User indicated login failed. Aborting.")
+                                    self.reset_ui()
+                                    return
+                        
+                        except Exception as e:
+                            self.log_message(f"Automatic login failed: {e}")
+                            
+                            # Fall back to manual login
+                            self.log_message("Falling back to manual login...")
+                            login_confirmed = Event()
+                            def show_login_prompt():
+                                messagebox.showinfo("Manual Login Required",
+                                                  "Automatic login failed. Please log in manually in the browser window. Click OK when finished.")
+                                login_confirmed.set()
+                            self.root.after(0, show_login_prompt)
+                            login_confirmed.wait()
+                            
+                            self.log_message("User confirmed manual login. Adding a longer wait (5s) for page elements to load...")
+                            page.wait_for_timeout(5000)
+                    else:
+                        self.log_message("No password provided, waiting for manual login...")
+                        self.update_status("Waiting for manual login...")
+                        login_confirmed = Event()
+                        def show_login_prompt():
+                            messagebox.showinfo("Manual Login Required",
+                                "Please log in to the website in the browser window. Click OK here when you are logged in and ready to proceed.")
+                            login_confirmed.set()
+                        self.root.after(0, show_login_prompt)
+                        login_confirmed.wait()
+                        self.log_message("User confirmed login. Adding a longer wait (5s) for page elements to load...")
+                        page.wait_for_timeout(5000)
 
                     self.log_message("Looking for the form iframe...")
                     try:
@@ -361,38 +452,65 @@ class FormFillerApp:
                         self.progress_bar["value"] = entry_num
                         self.root.update_idletasks()
                 
+                    # Replace the completion message and keep browser open:
                     if not self.stop_event.is_set():
                         self.log_message("All entries processed!")
                         self.update_status("Completed - Browser remains open")
-                        messagebox.showinfo("Complete", f"Form filling completed.\nSuccessful: {success_count}\nFailed: {failure_count}\n\nThe browser remains open for you to review or submit the data.")
+                        
+                        # Create a persistent flag to prevent browser from closing
+                        keep_browser_open = Event()
+                        
+                        def show_completion():
+                            nonlocal keep_browser_open
+                            messagebox.showinfo("Complete", f"Form filling completed.\nSuccessful: {success_count}\nFailed: {failure_count}\n\nThe browser will remain open until you click Close Browser.")
+                            # Create a new window with a "Close Browser" button
+                            browser_window = tk.Toplevel(self.root)
+                            browser_window.title("Browser Control")
+                            browser_window.geometry("300x100")
+                            browser_window.resizable(False, False)
+                            
+                            message = ttk.Label(browser_window, text="Browser window is kept open.\nClick 'Close Browser' when done.")
+                            message.pack(pady=10)
+                            
+                            def close_browser_and_window():
+                                try:
+                                    if browser and browser.is_connected():
+                                        browser.close()
+                                        self.log_message("Browser closed by user.")
+                                    browser_window.destroy()
+                                    keep_browser_open.set()
+                                except Exception as e:
+                                    self.log_message(f"Error closing browser: {e}")
+                                    browser_window.destroy()
+                                    keep_browser_open.set()
+                            
+                            close_button = ttk.Button(browser_window, text="Close Browser", command=close_browser_and_window)
+                            close_button.pack(pady=10)
+                            
+                            # Make sure the window stays on top
+                            browser_window.transient(self.root)
+                            browser_window.grab_set()
+                        
+                        # Show completion message in main thread
+                        self.root.after(0, show_completion)
+                        
+                        # This will block until the user closes the browser
+                        keep_browser_open.wait()
                     else:
-                         self.log_message("Automation stopped before completion.")
-                         self.update_status("Stopped")
-                         if browser:
-                             try:
-                                 browser.close()
-                             except Exception as close_err:
-                                 self.log_message(f"Error closing browser after stop: {close_err}")
+                        self.log_message("Automation stopped before completion.")
+                        self.update_status("Stopped")
         
                 except Exception as browser_err:
                     self.log_message(f"Browser/Navigation error: {str(browser_err)}")
                     messagebox.showerror("Error", f"An error occurred with the browser: {str(browser_err)}")
-                    if browser:
-                        try:
-                            browser.close()
-                        except Exception as close_err:
-                             self.log_message(f"Error closing browser after error: {close_err}")
+                    self.log_message("Browser window kept open for inspection despite error")
                     self.reset_ui()
                     return
         
         except Exception as e:
             self.log_message(f"Automation error: {str(e)}")
             messagebox.showerror("Error", f"An error occurred: {str(e)}")
-            if 'browser' in locals() and browser and browser.is_connected():
-                 try:
-                     browser.close()
-                 except Exception as close_err:
-                     self.log_message(f"Error closing browser after general error: {close_err}")
+            self.log_message("Browser window kept open for inspection despite error")
             self.reset_ui()
         finally:
             if self.stop_event.is_set():
